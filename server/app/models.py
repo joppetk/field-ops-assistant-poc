@@ -23,6 +23,20 @@ class Document(SQLModel, table=True):
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class DocumentChunk(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    document_id: int = Field(foreign_key="document.id", index=True)
+    source_filename: str
+
+    chunk_index: int
+    chunk_text: str
+    keywords: str = Field(default="")
+
+    page_number: Optional[int] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class FieldTask(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
 

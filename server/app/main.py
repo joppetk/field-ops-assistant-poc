@@ -1,16 +1,17 @@
 import os
 import shutil
 import uuid
-from datetime import datetime, timedelta
-from typing import List, Optional
+from datetime import timedelta
+from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from app.database import create_db_and_tables, get_session
-from app.models import User, Document, FieldTask
+from app.models import User, Document, DocumentChunk, FieldTask
 from app.auth import (
     hash_password,
     authenticate_user,
@@ -18,14 +19,16 @@ from app.auth import (
     get_current_user,
     require_admin,
 )
+from app.document_processor import process_file_to_chunks
+from app.retrieval_agent import search_chunks
 
 
 UPLOAD_DIR = "uploads"
 
 app = FastAPI(
     title="Offline Field Operations Assistant POC",
-    description="Day 1 backend for secure offline field operations assistant.",
-    version="0.1.0",
+    description="Day 2 backend with lightweight RAG retrieval.",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -35,6 +38,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class RagSearchRequest(BaseModel):
+    query: str
+    limit: Optional[int] = 5
 
 
 @app.on_event("startup")
@@ -57,7 +65,6 @@ def seed_demo_users():
       password: engineer123
     """
     from sqlmodel import Session
-
     from app.database import engine
 
     with Session(engine) as session:
@@ -84,13 +91,82 @@ def seed_demo_users():
         session.commit()
 
 
+def process_document_internal(document_id: int, session: Session):
+    """
+    Extract text from a document, split it into chunks,
+    and save chunks in the database.
+    """
+    document = session.get(Document, document_id)
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found."
+        )
+
+    if not os.path.exists(document.file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Document file not found on disk."
+        )
+
+    # Remove previous chunks for this document so re-processing is clean.
+    existing_chunks = session.exec(
+        select(DocumentChunk).where(DocumentChunk.document_id == document_id)
+    ).all()
+
+    for chunk in existing_chunks:
+        session.delete(chunk)
+
+    try:
+        chunk_records = process_file_to_chunks(
+            file_path=document.file_path,
+            original_filename=document.original_filename,
+            chunk_size_words=140,
+            overlap_words=30
+        )
+    except Exception as e:
+        session.commit()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process document: {str(e)}"
+        )
+
+    for record in chunk_records:
+        db_chunk = DocumentChunk(
+            document_id=document.id,
+            source_filename=record["source_filename"],
+            page_number=record["page_number"],
+            chunk_index=record["chunk_index"],
+            chunk_text=record["chunk_text"],
+            keywords=record["keywords"],
+        )
+        session.add(db_chunk)
+
+    session.commit()
+
+    return {
+        "document_id": document.id,
+        "original_filename": document.original_filename,
+        "chunks_created": len(chunk_records)
+    }
+
+
 @app.get("/")
 def root():
     return {
         "system": "Offline Field Operations Assistant POC",
-        "version": "0.1.0",
-        "day": "Day 1",
-        "status": "running"
+        "version": "0.2.0",
+        "day": "Day 2",
+        "status": "running",
+        "features": [
+            "login",
+            "document upload",
+            "document text extraction",
+            "document chunking",
+            "keyword-based RAG search",
+            "field task creation"
+        ]
     }
 
 
@@ -142,6 +218,7 @@ def get_me(current_user: User = Depends(get_current_user)):
 @app.post("/documents/upload")
 def upload_document(
     file: UploadFile = File(...),
+    auto_process: bool = Form(True),
     current_user: User = Depends(require_admin),
     session: Session = Depends(get_session)
 ):
@@ -173,6 +250,11 @@ def upload_document(
     session.commit()
     session.refresh(doc)
 
+    process_result = None
+
+    if auto_process:
+        process_result = process_document_internal(doc.id, session)
+
     return {
         "message": "Document uploaded successfully.",
         "document": {
@@ -182,7 +264,8 @@ def upload_document(
             "file_path": doc.file_path,
             "uploaded_by": doc.uploaded_by,
             "uploaded_at": doc.uploaded_at,
-        }
+        },
+        "processing": process_result
     }
 
 
@@ -193,9 +276,14 @@ def list_documents(
 ):
     docs = session.exec(select(Document).order_by(Document.uploaded_at.desc())).all()
 
-    return {
-        "count": len(docs),
-        "documents": [
+    output = []
+
+    for doc in docs:
+        chunks = session.exec(
+            select(DocumentChunk).where(DocumentChunk.document_id == doc.id)
+        ).all()
+
+        output.append(
             {
                 "id": doc.id,
                 "original_filename": doc.original_filename,
@@ -203,9 +291,118 @@ def list_documents(
                 "file_path": doc.file_path,
                 "uploaded_by": doc.uploaded_by,
                 "uploaded_at": doc.uploaded_at,
+                "chunk_count": len(chunks),
             }
-            for doc in docs
+        )
+
+    return {
+        "count": len(output),
+        "documents": output
+    }
+
+
+@app.post("/documents/{document_id}/process")
+def process_document(
+    document_id: int,
+    current_user: User = Depends(require_admin),
+    session: Session = Depends(get_session)
+):
+    result = process_document_internal(document_id, session)
+
+    return {
+        "message": "Document processed successfully.",
+        "result": result
+    }
+
+
+@app.post("/documents/process-all")
+def process_all_documents(
+    current_user: User = Depends(require_admin),
+    session: Session = Depends(get_session)
+):
+    documents = session.exec(select(Document)).all()
+
+    results = []
+
+    for doc in documents:
+        result = process_document_internal(doc.id, session)
+        results.append(result)
+
+    return {
+        "message": "All documents processed.",
+        "count": len(results),
+        "results": results
+    }
+
+
+@app.get("/documents/{document_id}/chunks")
+def get_document_chunks(
+    document_id: int,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    document = session.get(Document, document_id)
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found."
+        )
+
+    chunks = session.exec(
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.chunk_index)
+    ).all()
+
+    return {
+        "document": {
+            "id": document.id,
+            "original_filename": document.original_filename,
+        },
+        "chunk_count": len(chunks),
+        "chunks": [
+            {
+                "id": chunk.id,
+                "chunk_index": chunk.chunk_index,
+                "page_number": chunk.page_number,
+                "text": chunk.chunk_text,
+                "keywords": chunk.keywords,
+            }
+            for chunk in chunks
         ]
+    }
+
+
+@app.post("/rag/search")
+def rag_search(
+    request: RagSearchRequest,
+    current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session)
+):
+    query = request.query.strip()
+
+    if not query:
+        raise HTTPException(
+            status_code=400,
+            detail="Query cannot be empty."
+        )
+
+    limit = request.limit or 5
+    limit = max(1, min(limit, 20))
+
+    results = search_chunks(
+        session=session,
+        query=query,
+        limit=limit,
+        min_score=1
+    )
+
+    return {
+        "query": query,
+        "limit": limit,
+        "result_count": len(results),
+        "results": results
     }
 
 

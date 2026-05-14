@@ -4,3 +4,5 @@ sqlmodel
 python-multipart
 pyjwt
 pwdlib[argon2]
+pypdf
+python-docx
